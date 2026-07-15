@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import re
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 from huggingface_hub.errors import HfHubHTTPError
@@ -8,101 +10,126 @@ load_dotenv()
 
 client = InferenceClient(api_key=os.getenv("HF_API_KEY"))
 
-SYSTEM_PROMPT = """You are a professional text summarizer. Your job is to read the text
-provided by the user and produce a clear, concise summary in 2-3 sentences.
+SYSTEM_PROMPT = """You are a professional text summarizer. Read the text provided by the
+user and respond with ONLY a valid JSON object, no extra text before or after it.
+
+The JSON must follow this exact structure:
+{
+  "summary": "a 2-3 sentence summary of the text",
+  "key_points": ["point 1", "point 2", "point 3"],
+  "word_count": <integer, number of words in the summary>
+}
+
 Rules:
+- Output ONLY the JSON object. No explanations, no markdown code fences, no extra commentary.
 - Do not add opinions or information not present in the original text.
-- Keep the summary factual and neutral in tone.
-- Always respond with only the summary, no extra commentary."""
+- key_points should be 2-4 short bullet-style phrases."""
 
 FEW_SHOT_EXAMPLES = [
     {
         "role": "user",
-        "content": "Summarize this text:\n\nThe city council voted 7-2 to approve funding for a new public library. Construction is expected to begin in spring and finish within 18 months. Supporters say it will improve access to education in underserved neighborhoods."
+        "content": "Summarize this text as JSON:\n\nThe city council voted 7-2 to approve funding for a new public library. Construction is expected to begin in spring and finish within 18 months. Supporters say it will improve access to education in underserved neighborhoods."
     },
     {
         "role": "assistant",
-        "content": "The city council approved funding for a new public library, with construction starting in spring and finishing in about 18 months. Supporters believe it will improve educational access in underserved areas."
+        "content": '{"summary": "The city council approved funding for a new public library, with construction starting in spring and finishing in about 18 months. Supporters believe it will improve educational access in underserved areas.", "key_points": ["Council voted 7-2 to approve funding", "Construction begins spring, ~18 months", "Aims to improve education access"], "word_count": 30}'
     }
 ]
 
 MAX_RETRIES = 3
-BASE_DELAY = 2  # seconds, doubles each retry (exponential backoff)
+BASE_DELAY = 2
 
 
-def summarize_text(text, stream=True):
+def extract_json(raw_text):
+    """
+    Try to extract a valid JSON object from the model's raw text output.
+    Handles cases where the model wraps JSON in markdown fences or adds
+    extra commentary before/after the JSON.
+    """
+    # Try direct parse first
+    try:
+        return json.loads(raw_text.strip())
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find a JSON object embedded in the text (e.g. wrapped in ```json ... ```)
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def validate_summary_json(data):
+    """Check that the parsed JSON has the expected fields and types."""
+    if not isinstance(data, dict):
+        return False, "Response is not a JSON object."
+    if "summary" not in data or not isinstance(data["summary"], str) or not data["summary"].strip():
+        return False, "Missing or invalid 'summary' field."
+    if "key_points" not in data or not isinstance(data["key_points"], list) or len(data["key_points"]) == 0:
+        return False, "Missing or invalid 'key_points' field."
+    if "word_count" not in data or not isinstance(data["word_count"], int):
+        return False, "Missing or invalid 'word_count' field."
+    return True, None
+
+
+def summarize_text_structured(text):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *FEW_SHOT_EXAMPLES,
-        {"role": "user", "content": f"Summarize this text:\n\n{text}"}
+        {"role": "user", "content": f"Summarize this text as JSON:\n\n{text}"}
     ]
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            if stream:
-                full_response = ""
-                response_stream = client.chat.completions.create(
-                    model="meta-llama/Llama-3.1-8B-Instruct",
-                    messages=messages,
-                    max_tokens=200,
-                    stream=True
-                )
-                for chunk in response_stream:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta.content
-                    if delta:
-                        print(delta, end="", flush=True)
-                        full_response += delta
-                print()
-                return full_response
-            else:
-                response = client.chat.completions.create(
-                    model="meta-llama/Llama-3.1-8B-Instruct",
-                    messages=messages,
-                    max_tokens=200
-                )
-                return response.choices[0].message.content
+            response = client.chat.completions.create(
+                model="meta-llama/Llama-3.1-8B-Instruct",
+                messages=messages,
+                max_tokens=300
+            )
+            raw_output = response.choices[0].message.content
+
+            parsed = extract_json(raw_output)
+            if parsed is None:
+                print(f"[Warning] Attempt {attempt}: model did not return valid JSON. Raw output:\n{raw_output}\n")
+                if attempt < MAX_RETRIES:
+                    time.sleep(BASE_DELAY)
+                    continue
+                else:
+                    return {"error": "Model failed to return valid JSON after retries.", "raw_output": raw_output}
+
+            is_valid, reason = validate_summary_json(parsed)
+            if not is_valid:
+                print(f"[Warning] Attempt {attempt}: JSON structure invalid ({reason}). Raw output:\n{raw_output}\n")
+                if attempt < MAX_RETRIES:
+                    time.sleep(BASE_DELAY)
+                    continue
+                else:
+                    return {"error": f"Model returned malformed JSON structure: {reason}", "raw_output": raw_output}
+
+            return parsed
 
         except HfHubHTTPError as e:
             status = getattr(e.response, "status_code", None)
-
-            # Rate limit or server-side errors: worth retrying
             if status == 429 or (status is not None and status >= 500):
                 if attempt < MAX_RETRIES:
                     delay = BASE_DELAY * (2 ** (attempt - 1))
-                    print(f"\n[Warning] API busy (status {status}). Retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})")
+                    print(f"[Warning] API busy (status {status}). Retrying in {delay}s...")
                     time.sleep(delay)
                     continue
-                else:
-                    print(f"\n[Error] Failed after {MAX_RETRIES} attempts due to rate limiting/server error.")
-                    return None
-
-            # Auth/permission errors: no point retrying
+                return {"error": f"Failed after {MAX_RETRIES} attempts (status {status})."}
             elif status in (401, 403):
-                print(f"\n[Error] Authentication/permission problem (status {status}). Check your API key and token permissions.")
-                return None
-
-            # Any other API error
+                return {"error": f"Authentication/permission problem (status {status})."}
             else:
-                print(f"\n[Error] API error (status {status}): {e}")
-                return None
-
-        except TimeoutError:
-            if attempt < MAX_RETRIES:
-                delay = BASE_DELAY * (2 ** (attempt - 1))
-                print(f"\n[Warning] Request timed out. Retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})")
-                time.sleep(delay)
-                continue
-            else:
-                print(f"\n[Error] Timed out after {MAX_RETRIES} attempts.")
-                return None
+                return {"error": f"API error (status {status}): {e}"}
 
         except Exception as e:
-            print(f"\n[Error] Unexpected error: {e}")
-            return None
+            return {"error": f"Unexpected error: {e}"}
 
-    return None
+    return {"error": "Failed after all retries."}
 
 
 if __name__ == "__main__":
@@ -113,8 +140,6 @@ if __name__ == "__main__":
     categories while eliminating others, leading to significant
     workforce transitions across industries.
     """
-    print("Summary (streaming):")
-    result = summarize_text(sample_text, stream=True)
-
-    if result is None:
-        print("\nSummarization failed. Please check the error above.")
+    print("Structured summary (JSON):")
+    result = summarize_text_structured(sample_text)
+    print(json.dumps(result, indent=2))
