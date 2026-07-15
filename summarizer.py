@@ -6,7 +6,6 @@ load_dotenv()
 
 client = InferenceClient(api_key=os.getenv("HF_API_KEY"))
 
-# System prompt: sets the AI's role and rules
 SYSTEM_PROMPT = """You are a professional text summarizer. Your job is to read the text
 provided by the user and produce a clear, concise summary in 2-3 sentences.
 Rules:
@@ -14,7 +13,6 @@ Rules:
 - Keep the summary factual and neutral in tone.
 - Always respond with only the summary, no extra commentary."""
 
-# Few-shot examples: show the model what good input/output looks like
 FEW_SHOT_EXAMPLES = [
     {
         "role": "user",
@@ -26,19 +24,39 @@ FEW_SHOT_EXAMPLES = [
     }
 ]
 
-def summarize_text(text):
+def summarize_text(text, stream=True):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *FEW_SHOT_EXAMPLES,
         {"role": "user", "content": f"Summarize this text:\n\n{text}"}
     ]
 
-    response = client.chat.completions.create(
-        model="meta-llama/Llama-3.1-8B-Instruct",
-        messages=messages,
-        max_tokens=200
-    )
-    return response.choices[0].message.content
+    if stream:
+        # Streaming mode: print each chunk as it arrives
+        full_response = ""
+        response_stream = client.chat.completions.create(
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            messages=messages,
+            max_tokens=200,
+            stream=True
+        )
+        for chunk in response_stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content
+            if delta:
+                print(delta, end="", flush=True)
+                full_response += delta
+        print()  # newline after streaming finishes
+        return full_response
+    else:
+        # Non-streaming mode: wait for full response
+        response = client.chat.completions.create(
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            messages=messages,
+            max_tokens=200
+        )
+        return response.choices[0].message.content
 
 if __name__ == "__main__":
     sample_text = """
@@ -48,6 +66,5 @@ if __name__ == "__main__":
     categories while eliminating others, leading to significant
     workforce transitions across industries.
     """
-    result = summarize_text(sample_text)
-    print("Summary:")
-    print(result)
+    print("Summary (streaming):")
+    result = summarize_text(sample_text, stream=True)
