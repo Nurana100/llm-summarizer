@@ -92,6 +92,20 @@ def summarize_text_structured(text):
             )
             raw_output = response.choices[0].message.content
 
+            # Token usage / cost awareness
+            usage = getattr(response, "usage", None)
+            if usage:
+                prompt_tokens = usage.prompt_tokens
+                completion_tokens = usage.completion_tokens
+                total_tokens = usage.total_tokens
+                # Hugging Face free inference has no fixed $/token rate like OpenAI/Anthropic,
+                # so we log token counts as the primary cost signal.
+                print(f"[Usage] Prompt tokens: {prompt_tokens} | "
+                      f"Completion tokens: {completion_tokens} | "
+                      f"Total tokens: {total_tokens}")
+            else:
+                print("[Usage] Token usage data not returned by this model/provider.")
+
             parsed = extract_json(raw_output)
             if parsed is None:
                 print(f"[Warning] Attempt {attempt}: model did not return valid JSON. Raw output:\n{raw_output}\n")
