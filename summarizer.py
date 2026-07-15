@@ -1,6 +1,8 @@
 import os
+import time
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 
 load_dotenv()
 
@@ -24,6 +26,10 @@ FEW_SHOT_EXAMPLES = [
     }
 ]
 
+MAX_RETRIES = 3
+BASE_DELAY = 2  # seconds, doubles each retry (exponential backoff)
+
+
 def summarize_text(text, stream=True):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -31,32 +37,73 @@ def summarize_text(text, stream=True):
         {"role": "user", "content": f"Summarize this text:\n\n{text}"}
     ]
 
-    if stream:
-        # Streaming mode: print each chunk as it arrives
-        full_response = ""
-        response_stream = client.chat.completions.create(
-            model="meta-llama/Llama-3.1-8B-Instruct",
-            messages=messages,
-            max_tokens=200,
-            stream=True
-        )
-        for chunk in response_stream:
-            if not chunk.choices:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if stream:
+                full_response = ""
+                response_stream = client.chat.completions.create(
+                    model="meta-llama/Llama-3.1-8B-Instruct",
+                    messages=messages,
+                    max_tokens=200,
+                    stream=True
+                )
+                for chunk in response_stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        print(delta, end="", flush=True)
+                        full_response += delta
+                print()
+                return full_response
+            else:
+                response = client.chat.completions.create(
+                    model="meta-llama/Llama-3.1-8B-Instruct",
+                    messages=messages,
+                    max_tokens=200
+                )
+                return response.choices[0].message.content
+
+        except HfHubHTTPError as e:
+            status = getattr(e.response, "status_code", None)
+
+            # Rate limit or server-side errors: worth retrying
+            if status == 429 or (status is not None and status >= 500):
+                if attempt < MAX_RETRIES:
+                    delay = BASE_DELAY * (2 ** (attempt - 1))
+                    print(f"\n[Warning] API busy (status {status}). Retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print(f"\n[Error] Failed after {MAX_RETRIES} attempts due to rate limiting/server error.")
+                    return None
+
+            # Auth/permission errors: no point retrying
+            elif status in (401, 403):
+                print(f"\n[Error] Authentication/permission problem (status {status}). Check your API key and token permissions.")
+                return None
+
+            # Any other API error
+            else:
+                print(f"\n[Error] API error (status {status}): {e}")
+                return None
+
+        except TimeoutError:
+            if attempt < MAX_RETRIES:
+                delay = BASE_DELAY * (2 ** (attempt - 1))
+                print(f"\n[Warning] Request timed out. Retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(delay)
                 continue
-            delta = chunk.choices[0].delta.content
-            if delta:
-                print(delta, end="", flush=True)
-                full_response += delta
-        print()  # newline after streaming finishes
-        return full_response
-    else:
-        # Non-streaming mode: wait for full response
-        response = client.chat.completions.create(
-            model="meta-llama/Llama-3.1-8B-Instruct",
-            messages=messages,
-            max_tokens=200
-        )
-        return response.choices[0].message.content
+            else:
+                print(f"\n[Error] Timed out after {MAX_RETRIES} attempts.")
+                return None
+
+        except Exception as e:
+            print(f"\n[Error] Unexpected error: {e}")
+            return None
+
+    return None
+
 
 if __name__ == "__main__":
     sample_text = """
@@ -68,3 +115,6 @@ if __name__ == "__main__":
     """
     print("Summary (streaming):")
     result = summarize_text(sample_text, stream=True)
+
+    if result is None:
+        print("\nSummarization failed. Please check the error above.")
