@@ -2,6 +2,7 @@ import os
 import time
 import json
 import re
+import random
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 from huggingface_hub.errors import HfHubHTTPError
@@ -9,10 +10,17 @@ from requests.exceptions import Timeout, ConnectionError as RequestsConnectionEr
 
 load_dotenv()
 
+HF_API_KEY = os.getenv("HF_API_KEY")
+if not HF_API_KEY:
+    raise RuntimeError(
+        "HF_API_KEY is not set. Copy .env.example to .env and add your "
+        "Hugging Face API key before running this script."
+    )
+
 # Client-level timeout (seconds) — applies to each individual request.
 REQUEST_TIMEOUT = 30
 
-client = InferenceClient(api_key=os.getenv("HF_API_KEY"), timeout=REQUEST_TIMEOUT)
+client = InferenceClient(api_key=HF_API_KEY, timeout=REQUEST_TIMEOUT)
 
 SYSTEM_PROMPT = """You are a professional text summarizer. Read the text provided by the
 user and respond with ONLY a valid JSON object, no extra text before or after it.
@@ -32,11 +40,20 @@ Rules:
 FEW_SHOT_EXAMPLES = [
     {
         "role": "user",
-        "content": "Summarize this text as JSON:\n\nThe city council voted 7-2 to approve funding for a new public library. Construction is expected to begin in spring and finish within 18 months. Supporters say it will improve access to education in underserved neighborhoods."
+        "content": (
+            "Summarize this text as JSON:\n\n"
+            "<document>\n"
+            "The city council voted 7-2 to approve funding for a new public library. "
+            "Construction is expected to begin in spring and finish within 18 months. "
+            "Supporters say it will improve access to education in underserved neighborhoods.\n"
+            "</document>"
+        )
     },
     {
         "role": "assistant",
-        "content": '{"summary": "The city council approved funding for a new public library, with construction starting in spring and finishing in about 18 months. Supporters believe it will improve educational access in underserved areas.", "key_points": ["Council voted 7-2 to approve funding", "Construction begins spring, ~18 months", "Aims to improve education access"], "word_count": 30}'
+        # NOTE: word_count must equal the actual whitespace-separated word count
+        # of "summary" below (31 words) — keep these in sync if you edit the example.
+        "content": '{"summary": "The city council approved funding for a new public library, with construction starting in spring and finishing in about 18 months. Supporters believe it will improve educational access in underserved areas.", "key_points": ["Council voted 7-2 to approve funding", "Construction begins spring, ~18 months", "Aims to improve education access"], "word_count": 31}'
     }
 ]
 
@@ -77,6 +94,12 @@ def validate_summary_json(data):
     if not isinstance(data, dict):
         return False, "Response is not a JSON object."
 
+    # --- strict schema: no unexpected fields ---
+    allowed_fields = {"summary", "key_points", "word_count"}
+    unexpected = set(data.keys()) - allowed_fields
+    if unexpected:
+        return False, f"Unexpected field(s) in response: {sorted(unexpected)}."
+
     # --- summary ---
     if "summary" not in data or not isinstance(data["summary"], str) or not data["summary"].strip():
         return False, "Missing or invalid 'summary' field."
@@ -104,6 +127,12 @@ def validate_summary_json(data):
         )
 
     return True, None
+
+
+def _backoff_delay(attempt):
+    """Exponential backoff with random jitter (avoids retry storms)."""
+    base = BASE_DELAY * (2 ** (attempt - 1))
+    return base + random.uniform(0, base * 0.5)
 
 
 def _log_usage(usage):
@@ -149,7 +178,10 @@ def summarize_text_structured(text, stream=True):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *FEW_SHOT_EXAMPLES,
-        {"role": "user", "content": f"Summarize this text as JSON:\n\n{text}"}
+        {
+            "role": "user",
+            "content": f"Summarize this text as JSON:\n\n<document>\n{text.strip()}\n</document>"
+        }
     ]
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -189,8 +221,8 @@ def summarize_text_structured(text, stream=True):
 
         except (Timeout, RequestsConnectionError) as e:
             if attempt < MAX_RETRIES:
-                delay = BASE_DELAY * (2 ** (attempt - 1))
-                print(f"[Warning] Request timed out/connection error. Retrying in {delay}s... ({e})")
+                delay = _backoff_delay(attempt)
+                print(f"[Warning] Request timed out/connection error. Retrying in {delay:.1f}s... ({e})")
                 time.sleep(delay)
                 continue
             return {"error": f"Failed after {MAX_RETRIES} attempts due to timeout/connection error."}
@@ -199,8 +231,19 @@ def summarize_text_structured(text, stream=True):
             status = getattr(e.response, "status_code", None)
             if status == 429 or (status is not None and status >= 500):
                 if attempt < MAX_RETRIES:
-                    delay = BASE_DELAY * (2 ** (attempt - 1))
-                    print(f"[Warning] API busy (status {status}). Retrying in {delay}s...")
+                    # Prefer the server's Retry-After header when present (esp. for 429s),
+                    # otherwise fall back to jittered exponential backoff.
+                    retry_after = None
+                    headers = getattr(e.response, "headers", None) or {}
+                    raw_retry_after = headers.get("Retry-After")
+                    if raw_retry_after is not None:
+                        try:
+                            retry_after = float(raw_retry_after)
+                        except (TypeError, ValueError):
+                            retry_after = None
+
+                    delay = retry_after if retry_after is not None else _backoff_delay(attempt)
+                    print(f"[Warning] API busy (status {status}). Retrying in {delay:.1f}s...")
                     time.sleep(delay)
                     continue
                 return {"error": f"Failed after {MAX_RETRIES} attempts (status {status})."}
